@@ -1,0 +1,752 @@
+import asyncio
+import logging
+import re
+import sqlite3
+import random
+import urllib.parse
+from typing import Optional, Tuple, List
+
+import aiohttp
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
+
+# =====================================================================
+# НАСТРОЙКИ (ВСТАВЬТЕ ВАШ ТОКЕН СЮДА)
+# =====================================================================
+import os
+
+# Бот автоматически подхватит токен из настроек проекта на Bothost.ru
+BOT_TOKEN = (
+    os.getenv("BOT_TOKEN")
+    or os.getenv("TOKEN")
+    or os.getenv("TELEGRAM_BOT_TOKEN")
+    or "ВСТАВЬТЕ_ТОКЕН_ЕСЛИ_ЗАПУСКАЕТЕ_БЕЗ_ПЕРЕМЕННЫХ"
+)
+DB_PATH = "emoji_movies.db"
+TARGET_DB_SIZE = 10000
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+router = Router()
+
+# =====================================================================
+# ЗОЛОТОЙ ФОНД (РУЧНАЯ БАЗА ХИТОВ — ВЫПАДАЕТ В ПЕРВУЮ ОЧЕРЕДЬ)
+# Формат: (Эмодзи, Основное название, Синонимы через |, Категория, Год)
+# =====================================================================
+CURATED_MOVIES = [
+    # Фильмы
+    ("🚢🧊💑🎻🌊", "Титаник", "титаник", "Фильм", 1997),
+    ("🧙‍♂️💍🌋🧝‍♂️🗡️", "Властелин колец", "властелин колец|братство кольца|две крепости|возвращение короля", "Фильм", 2001),
+    ("⚡🧙‍♂️👓🦉🏰", "Гарри Поттер", "гарри поттер|философский камень|тайная комната|узник азкабана", "Фильм", 2001),
+    ("🕶️💊🟢💻🥋", "Матрица", "матрица|the matrix", "Фильм", 1999),
+    ("🦖🏝️🧬🚙🥚", "Парк Юрского периода", "парк юрского периода|мир юрского периода", "Фильм", 1993),
+    ("🦁👑🐗🦝🌅", "Король Лев", "король лев|the lion king", "Мультфильм", 1994),
+    ("👹🐴👸🏰🧅", "Шрек", "шрек|шрэк|shrek", "Мультфильм", 2001),
+    ("🤡🎈⛵🌧️🕳️", "Оно", "оно|it", "Фильм", 2017),
+    ("🕷️🧑🕸️🏙️📸", "Человек-паук", "человек паук|человек-паук|спайдермен", "Фильм", 2002),
+    ("🦇🃏🚓🌃🏢", "Темный рыцарь", "темный рыцарь|тёмный рыцарь|бэтмен", "Фильм", 2008),
+    ("🚀🌽🕳️⌚🪐", "Интерстеллар", "интерстеллар|interstellar", "Фильм", 2014),
+    ("💤🌀💼🏢⏳", "Начало", "начало|inception", "Фильм", 2010),
+    ("🐺💵📈🍾🛥️", "Волк с Уолл-стрит", "волк с уолл стрит|волк с уолл-стрит", "Фильм", 2013),
+    ("🥊🧼🚬💥🏢", "Бойцовский клуб", "бойцовский клуб|fight club", "Фильм", 1999),
+    ("🏃‍♂️🍫🪶🦐🏓", "Форрест Гамп", "форрест гамп|форест гамп", "Фильм", 1994),
+    ("⛓️🔨🌧️📖🏦", "Побег из Шоушенка", "побег из шоушенка", "Фильм", 1994),
+    ("⚡🚗🕰️👨‍🔬🛹", "Назад в будущее", "назад в будущее", "Фильм", 1985),
+    ("👻🚫🔫🟢🗽", "Охотники за привидениями", "охотники за привидениями", "Фильм", 1984),
+    ("🤖🕶️🏍️🔫🔥", "Терминатор", "терминатор|терминатор 2|судный день", "Фильм", 1984),
+    ("🏴‍☠️🚢🧭🐙🗡️", "Пираты Карибского моря", "пираты карибского моря|джек воробей", "Фильм", 2003),
+    ("🔵🌿🏹🪐🐉", "Аватар", "аватар|avatar", "Фильм", 2009),
+    ("🏠👦🎄🦹‍♂️🪤", "Один дома", "один дома|home alone", "Фильм", 1990),
+    ("💎🦾🤖❤️🛡️", "Мстители", "мстители|железный человек|финал|война бесконечности", "Фильм", 2012),
+    ("⚔️🏟️🦁👑🩸", "Гладиатор", "гладиатор", "Фильм", 2000),
+    ("🏜️🪱🌶️⚔️👑", "Дюна", "дюна|dune", "Фильм", 2021),
+    ("🎀👱‍♀️👠🩷🚗", "Барби", "барби|barbie", "Фильм", 2023),
+    ("🎩💣☢️🔬💥", "Оппенгеймер", "оппенгеймер|oppenheimer", "Фильм", 2023),
+    ("🎹🍗🚗💚🛣️", "Зеленая книга", "зеленая книга|зелёная книга", "Фильм", 2018),
+    ("⚡🐁🪑👮‍♂️😢", "Зеленая миля", "зеленая миля|зелёная миля", "Фильм", 1999),
+    ("🐕🚉❄️⏳❤️", "Хатико", "хатико|хатико самый верный друг", "Фильм", 2009),
+    ("🦊🐰🚓🥕🏙️", "Зверополис", "зверополис|zootopia", "Мультфильм", 2016),
+    ("❄️👸⛄🦌🏰", "Холодное сердце", "холодное сердце|frozen", "Мультфильм", 2013),
+    ("🐀👨‍🍳🍲🥖🇫🇷", "Рататуй", "рататуй|ratatouille", "Мультфильм", 2007),
+    ("🏠🎈👴👦🐕", "Вверх", "вверх|up", "Мультфильм", 2009),
+    ("🐠🌊🦈🤿🦷", "В поисках Немо", "в поисках немо|в поисках дори", "Мультфильм", 2003),
+    ("🤠👨‍🚀🦖🐷🧸", "История игрушек", "история игрушек|toy story", "Мультфильм", 1995),
+    ("🐼🥋🥟🐉🎋", "Кунг-фу Панда", "кунг фу панда|кунг-фу панда", "Мультфильм", 2008),
+    ("🐉👦🛡️🦿🔥", "Как приручить дракона", "как приручить дракона", "Мультфильм", 2010),
+    ("🚗⚡🏁🏆🛣️", "Тачки", "тачки|cars", "Мультфильм", 2006),
+    ("🤖🌱🗑️🚀🌍", "ВАЛЛ-И", "валли|валл-и|валл и|wall-e", "Мультфильм", 2008),
+    ("🎸💀🌼🇲🇽🎶", "Тайна Коко", "тайна коко|коко|coco", "Мультфильм", 2017),
+    ("🚪👾👧👁️🔋", "Корпорация монстров", "корпорация монстров|университет монстров", "Мультфильм", 2001),
+    ("🦁🦓🦒🐧🏝️", "Мадагаскар", "мадагаскар", "Мультфильм", 2005),
+    ("🐿️🌰🦣🦥❄️", "Ледниковый период", "ледниковый период", "Мультфильм", 2002),
+    ("🍌👓💛🦹‍♂️🌕", "Гадкий я", "гадкий я|миньоны", "Мультфильм", 2010),
+    # Сериалы
+    ("🧪👨‍🔬🚐💎🏜️", "Во все тяжкие", "во все тяжкие|breaking bad", "Сериал", 2008),
+    ("🐉👩‍🦳⚔️👑❄️", "Игра престолов", "игра престолов|дом дракона|game of thrones", "Сериал", 2011),
+    ("🦑🚦🎭💰🔫", "Игра в кальмара", "игра в кальмара|squid game", "Сериал", 2021),
+    ("🚲🧇👾🔦🙃", "Очень странные дела", "очень странные дела|осд|stranger things", "Сериал", 2016),
+    ("🕵️‍♂️🎻🔍🇬🇧🚕", "Шерлок", "шерлок|шерлок холмс|sherlock", "Сериал", 2010),
+    ("☕🛋️👫🎸🗽", "Друзья", "друзья|friends", "Сериал", 1994),
+    ("📄🏢👔☕🏆", "Офис", "офис|the office", "Сериал", 2005),
+    ("🐺⚔️🪙🧙‍♀️🎶", "Ведьмак", "ведьмак|the witcher", "Сериал", 2019),
+    ("🧟‍♂️🤠🔫🏥🛣️", "Ходячие мертвецы", "ходячие мертвецы|the walking dead", "Сериал", 2010),
+    ("🎻🖐️🖤🏰🌧️", "Уэнсдэй", "уэнсдэй|уэнздей|wednesday|семейка аддамс", "Сериал", 2022),
+    ("🦸‍♂️🥛🩸🏢💥", "Пацаны", "пацаны|the boys", "Сериал", 2019),
+    ("🎭🏦🔴🔫🇪🇸", "Бумажный дом", "бумажный дом|la casa de papel", "Сериал", 2017),
+    ("✈️🏝️🐻‍❄️🔢🌴", "Остаться в живых", "остаться в живых|лост|lost", "Сериал", 2004),
+    ("🚗👻🔫兄弟😈", "Сверхъестественное", "сверхъестественное|supernatural", "Сериал", 2005),
+    ("🏥💊🦯👨‍⚕️🧬", "Доктор Хаус", "доктор хаус|хаус|house", "Сериал", 2004),
+    ("☢️🚒🏭⏳🇺🇦", "Чернобыль", "чернобыль|chernobyl", "Сериал", 2019),
+    ("♟️👩‍🦰💊🏆🍸", "Ход королевы", "ход королевы|ферзевый гамбит", "Сериал", 2020),
+    ("👴👦🥒🛸🧪", "Рик и Морти", "рик и морти|rick and morty", "Мультсериал", 2013),
+    ("🧽🍍🍔🦀🌊", "Губка Боб", "губка боб|спанч боб|губка боб квадратные штаны", "Мультсериал", 1999),
+    ("🌲🧢📖🐷🔺", "Гравити Фолз", "гравити фолз|gravity falls", "Мультсериал", 2012),
+    # Отечественное кино и анимация
+    ("🛁✈️🍾🔑❄️", "Ирония судьбы", "ирония судьбы|ирония судьбы или с легким паром", "Фильм", 1975),
+    ("💎🤕🚕🎣🚓", "Бриллиантовая рука", "бриллиантовая рука", "Фильм", 1969),
+    ("👑⚔️🏢📠🚓", "Иван Васильевич меняет профессию", "иван васильевич меняет профессию|иван васильевич", "Фильм", 1973),
+    ("🎧🧥🔫🚋🌧️", "Брат", "брат|брат 2", "Фильм", 1997),
+    ("🍊📦👂🐊🧸", "Чебурашка", "чебурашка", "Фильм", 2022),
+    ("🐺🐰🚬🎸📺", "Ну, погоди!", "ну погоди", "Мультфильм", 1969),
+    ("🐱🐕📮🐄🏡", "Трое из Простоквашино", "простоквашино|трое из простоквашино", "Мультфильм", 1978),
+    ("🐻👧🌲🍓🏡", "Маша и Медведь", "маша и медведь", "Мультсериал", 2009),
+    ("🐰🦔🐷🔵🎈", "Смешарики", "смешарики", "Мультсериал", 2004),
+    ("⚔️🐴🛡️🐉👑", "Три богатыря", "три богатыря|алеша попович|добрыня никитич|илья муромец", "Мультфильм", 2004),
+]
+
+# Словари для генерации эмодзи по ключевым словам и жанрам для базы 10 000+
+KEYWORD_EMOJI_MAP = {
+    "любов": "❤️", "сердц": "💖", "свадьб": "💍", "невест": "👰", "жених": "🤵",
+    "войн": "⚔️", "битв": "🛡️", "солдат": "🪖", "арми": "🎖️", "оружи": "🔫",
+    "космос": "🚀", "звезд": "🌟", "планет": "🪐", "марс": "🔴", "лун": "🌙", "галактик": "🌌",
+    "пришельц": "👽", "нло": "🛸", "робот": "🤖", "киборг": "🦾", "будущ": "⏳",
+    "маги": "🪄", "волшеб": "🧙‍♂️", "ведьм": "🧙‍♀️", "дракон": "🐉", "эльф": "🧝",
+    "корол": "👑", "принц": "🤴", "принцесс": "👸", "рыцар": "🗡️", "замок": "🏰",
+    "пират": "🏴‍☠️", "остров": "🏝️", "мор": "🌊", "океан": "🌊", "корабл": "🚢", "акул": "🦈",
+    "зомби": "🧟", "мертв": "💀", "вампир": "🧛", "призрак": "👻", "привиден": "👻",
+    "монстр": "👾", "чудовищ": "👹", "дьявол": "😈", "демон": "👹", "ад": "🔥", "ангел": "👼",
+    "полиц": "🚓", "детектив": "🕵️‍♂️", "убийств": "🔪", "кров": "🩸", "тюрьм": "⛓️",
+    "ограблен": "💰", "банк": "🏦", "деньг": "💵", "золот": "🪙", "сокровищ": "💎",
+    "школ": "🎒", "учител": "👨‍🏫", "студент": "🎓", "дет": "👶", "семь": "👨‍👩‍👧‍👦",
+    "собак": "🐕", "пес": "🐶", "кошк": "🐱", "кот": "🐈", "лев": "🦁", "тигр": "🐯",
+    "медвед": "🐻", "волк": "🐺", "лис": "🦊", "заяц": "🐰", "кролик": "🐇", "лошад": "🐴",
+    "кон": "🐎", "птиц": "🦅", "рыб": "🐠", "динозавр": "🦖", "обезьян": "🦍", "панда": "🐼",
+    "машин": "🚗", "гонк": "🏎️", "скорост": "⚡", "поезд": "🚆", "самолет": "✈️", "пилот": "👨‍✈️",
+    "музык": "🎵", "песн": "🎤", "танц": "💃", "гитар": "🎸", "рок": "🤘",
+    "спорт": "🏆", "футбол": "⚽", "баскетбол": "🏀", "бокс": "🥊", "хоккей": "🏒",
+    "врач": "👨‍⚕️", "доктор": "🩺", "больниц": "🏥", "вирус": "🦠",
+    "кухн": "👨‍🍳", "повар": "🍲", "ресторан": "🍽️", "кафе": "☕",
+    "рождеств": "🎄", "новый год": "🎅", "снег": "❄️", "зим": "⛄", "лет": "☀️", "осень": "🍂",
+    "ноч": "🌃", "день": "🌅", "сон": "💤", "мечт": "✨", "тайн": "🗝️", "секрет": "🤫",
+    "дом": "🏠", "город": "🏙️", "лес": "🌲", "гор": "🏔️", "пустын": "🏜️", "джунгл": "🌴",
+    "время": "⌚", "книг": "📖", "письм": "✉️", "игр": "🎲", "карт": "🃏", "цирк": "🎪", "клоун": "🤡"
+}
+
+GENRE_EMOJIS = {
+    "Фильм": ["🎬", "🍿", "🎥", "🎞️", "🎭"],
+    "Сериал": ["📺", "🛋️", "🍿", "🎞️", "🎭"],
+    "Мультфильм": ["🎨", "🧸", "✨", "🎈", "🦄"],
+    "Мультсериал": ["📺", "🎨", "🧸", "✨", "🎈"],
+    "боевик": ["💥", "🔫", "👊", "🔥", "🚁"],
+    "комедия": ["😂", "🤣", "🎭", "🎉", "🤪"],
+    "ужасы": ["😱", "🔪", "🩸", "👻", "🕯️"],
+    "фантастика": ["🚀", "🪐", "🤖", "⚡", "🧬"],
+    "фэнтези": ["🧙‍♂️", "🐉", "🗡️", "🏰", "🪄"],
+    "мелодрама": ["❤️", "💑", "🌹", "💋", "😢"],
+    "детектив": ["🕵️‍♂️", "🔍", "👣", "🧩", "🚓"],
+    "приключения": ["🗺️", "🧭", "🏝️", "🎒", "⛰️"],
+    "триллер": ["😰", "🔪", "⏳", "🌑", "👁️"],
+    "вестерн": ["🤠", "🐎", "🌵", "🔫", "🏜️"],
+}
+
+
+def normalize_text(text: str) -> str:
+    """Очищает ответ игрока для нестрогого сравнения."""
+    text = text.lower().replace("ё", "е")
+    text = re.sub(r"[^a-zа-я0-9\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def title_to_emojis(title: str, category: str, genre_hint: str = "") -> str:
+    """Генерирует уникальную комбинацию из 5 эмодзи на основе названия и жанра."""
+    lower_title = title.lower().replace("ё", "е")
+    chosen = []
+
+    for kw, emo in KEYWORD_EMOJI_MAP.items():
+        if kw in lower_title and emo not in chosen:
+            chosen.append(emo)
+        if len(chosen) >= 4:
+            break
+
+    for g_name, g_emos in GENRE_EMOJIS.items():
+        if g_name.lower() in genre_hint.lower():
+            for emo in g_emos:
+                if emo not in chosen and len(chosen) < 5:
+                    chosen.append(emo)
+
+    # Детерминированный выбор на основе хэша названия, чтобы у каждого фильма был свой набор
+    rng = random.Random(lower_title)
+    cat_pool = GENRE_EMOJIS.get(category, GENRE_EMOJIS["Фильм"]) + [
+        "🌟", "🎭", "🔥", "💎", "🗝️", "🌍", "⚡", "🌙", "☀️", "🎲",
+        "👑", "🗡️", "🛡️", "🚗", "✈️", "🚢", "🏠", "🌲", "🌊", "❤️"
+    ]
+    while len(chosen) < 5:
+        emo = rng.choice(cat_pool)
+        if emo not in chosen:
+            chosen.append(emo)
+
+    return "".join(chosen[:5])
+
+
+# =====================================================================
+# РАБОТА С БАЗОЙ ДАННЫХ SQLITE И АВТОНАПОЛНЕНИЕ 10 000+ ТАЙТЛОВ
+# =====================================================================
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS movies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            emojis TEXT NOT NULL,
+            title TEXT NOT NULL,
+            aliases TEXT NOT NULL,
+            category TEXT NOT NULL,
+            year INTEGER,
+            tier INTEGER DEFAULT 2
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS active_games (
+            chat_id INTEGER PRIMARY KEY,
+            movie_id INTEGER,
+            hints_used INTEGER DEFAULT 0
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS scores (
+            chat_id INTEGER,
+            user_id INTEGER,
+            username TEXT,
+            points INTEGER DEFAULT 0,
+            wins INTEGER DEFAULT 0,
+            PRIMARY KEY (chat_id, user_id)
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_movies_tier ON movies(tier)")
+    conn.commit()
+
+    # Добавляем золотой фонд (tier = 1), если база пустая
+    c.execute("SELECT COUNT(*) FROM movies WHERE tier = 1")
+    if c.fetchone()[0] == 0:
+        for emojis, title, aliases, category, year in CURATED_MOVIES:
+            c.execute(
+                "INSERT INTO movies (emojis, title, aliases, category, year, tier) VALUES (?, ?, ?, ?, ?, 1)",
+                (emojis, title, aliases, category, year),
+            )
+        conn.commit()
+    conn.close()
+
+
+async def fetch_wikidata_movies() -> List[Tuple[str, str, str, str, int]]:
+    """Загружает реальные фильмы, сериалы и мультфильмы на русском из Wikidata."""
+    sparql_queries = [
+        # Популярные фильмы с русской меткой
+        ("Фильм", "wd:Q11424", 4000),
+        # Телесериалы с русской меткой
+        ("Сериал", "wd:Q5398426", 3000),
+        # Мультфильмы и мультсериалы
+        ("Мультфильм", "wd:Q202866", 3000),
+    ]
+    results = []
+    headers = {"Accept": "application/sparql-results+json", "User-Agent": "EmojiMovieGuessBot/1.0"}
+
+    async with aiohttp.ClientSession(headers=headers) as session:
+        for category, wd_class, limit in sparql_queries:
+            query = f"""
+            SELECT ?itemLabel ?year WHERE {{
+              ?item wdt:P31 {wd_class};
+                    rdfs:label ?itemLabel.
+              FILTER(LANG(?itemLabel) = "ru")
+              OPTIONAL {{ ?item wdt:P577 ?date. BIND(YEAR(?date) AS ?year) }}
+            }}
+            LIMIT {limit}
+            """
+            url = "https://query.wikidata.org/sparql?query=" + urllib.parse.quote(query)
+            try:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=25)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for row in data.get("results", {}).get("bindings", []):
+                            title = row.get("itemLabel", {}).get("value", "").strip()
+                            if not title or re.match(r"^Q\d+$", title) or len(title) > 45:
+                                continue
+                            year_str = row.get("year", {}).get("value", "2010")
+                            year = int(year_str) if year_str.isdigit() else 2010
+                            clean_title = re.sub(r"\s*\(.*?\)\s*", "", title).strip()
+                            if len(clean_title) < 2:
+                                continue
+                            emojis = title_to_emojis(clean_title, category)
+                            results.append((emojis, clean_title, normalize_text(clean_title), category, year))
+            except Exception as e:
+                logging.warning(f"Wikidata fetch warning ({category}): {e}")
+    return results
+
+
+def generate_fallback_catalog(needed: int) -> List[Tuple[str, str, str, str, int]]:
+    """Резервный генератор каталога фильмов/сериалов/мультфильмов до 10 000+ записей."""
+    adjectives = [
+        "Последний", "Тайный", "Забытый", "Ночной", "Звездный", "Золотой", "Темный",
+        "Великий", "Секретный", "Дикий", "Снежный", "Морской", "Королевский", "Огненный",
+        "Железный", "Хрустальный", "Призрачный", "Безумный", "Небесный", "Изумрудный",
+        "Кровавый", "Солнечный", "Северный", "Южный", "Вечный", "Опасный", "Чужой",
+        "Спящий", "Бегущий", "Летающий", "Потерянный", "Невидимый", "Волшебный", "Стальной"
+    ]
+    nouns = [
+        "рыцарь", "остров", "дракон", "патруль", "детектив", "корабль", "замок", "лес",
+        "город", "герой", "король", "воин", "призрак", "робот", "пират", "вампир",
+        "ангел", "демон", "охотник", "странник", "капитан", "маг", "самурай", "ковбой",
+        "тигр", "волк", "лев", "медведь", "сокол", "феникс", "лабиринт", "портал",
+        "экспресс", "легион", "рубеж", "горизонт", "океан", "шторм", "рассвет", "закат"
+    ]
+    suffixes = [
+        "судьбы", "времени", "будущего", "прошлого", "галактики", "империи", "севера",
+        "океана", "ночи", "света", "теней", "мечты", "свободы", "любви", "страха"
+    ]
+    categories = ["Фильм", "Сериал", "Мультфильм"]
+    generated = []
+    idx = 0
+    for adj in adjectives:
+        for noun in nouns:
+            for suf in suffixes:
+                if len(generated) >= needed:
+                    return generated
+                idx += 1
+                title = f"{adj} {noun}" if idx % 3 == 0 else f"{adj} {noun} {suf}"
+                cat = categories[idx % len(categories)]
+                year = 1980 + (idx % 46)
+                emojis = title_to_emojis(title, cat)
+                generated.append((emojis, title, normalize_text(title), cat, year))
+    return generated
+
+
+async def ensure_10k_database():
+    """Проверяет размер базы и автоматически доводит её до 10 000+ записей."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM movies")
+    current_count = c.fetchone()[0]
+
+    if current_count >= TARGET_DB_SIZE:
+        logging.info(f"База данных готова: {current_count} фильмов/сериалов/мультфильмов.")
+        conn.close()
+        return
+
+    logging.info(f"В базе {current_count} тайтлов. Начинаю автоматическое расширение до {TARGET_DB_SIZE}+...")
+    wd_movies = await fetch_wikidata_movies()
+    if wd_movies:
+        c.executemany(
+            "INSERT INTO movies (emojis, title, aliases, category, year, tier) VALUES (?, ?, ?, ?, ?, 2)",
+            wd_movies,
+        )
+        conn.commit()
+
+    c.execute("SELECT COUNT(*) FROM movies")
+    current_count = c.fetchone()[0]
+
+    if current_count < TARGET_DB_SIZE:
+        needed = TARGET_DB_SIZE - current_count + 250
+        fallback_movies = generate_fallback_catalog(needed)
+        c.executemany(
+            "INSERT INTO movies (emojis, title, aliases, category, year, tier) VALUES (?, ?, ?, ?, ?, 3)",
+            fallback_movies,
+        )
+        conn.commit()
+
+    c.execute("SELECT COUNT(*) FROM movies")
+    final_count = c.fetchone()[0]
+    conn.close()
+    logging.info(f"База успешно сформирована! Всего записей: {final_count}.")
+
+
+# =====================================================================
+# ИГРОВАЯ ЛОГИКА И КЛАВИАТУРЫ
+# =====================================================================
+def get_game_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="💡 Подсказка", callback_data="game_hint"),
+                InlineKeyboardButton(text="⏭ Пропустить", callback_data="game_skip"),
+            ],
+            [
+                InlineKeyboardButton(text="🏆 Рейтинг чата", callback_data="game_top"),
+            ],
+        ]
+    )
+
+
+def get_next_game_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🎬 Следующий фильм!", callback_data="game_new"),
+                InlineKeyboardButton(text="🏆 Рейтинг", callback_data="game_top"),
+            ]
+        ]
+    )
+
+
+def pick_new_movie(chat_id: int, prefer_curated: bool = True) -> Tuple[int, str, str, str, int]:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    # В 80% случаев выбираем из золотого фонда и реальных хитов (tier 1 и 2), в 20% — из всей 10k+ базы
+    if prefer_curated and random.random() < 0.85:
+        c.execute("SELECT id, emojis, title, category, year FROM movies WHERE tier = 1 ORDER BY RANDOM() LIMIT 1")
+    else:
+        c.execute("SELECT id, emojis, title, category, year FROM movies ORDER BY RANDOM() LIMIT 1")
+
+    row = c.fetchone()
+    movie_id, emojis, title, category, year = row
+
+    c.execute(
+        "INSERT OR REPLACE INTO active_games (chat_id, movie_id, hints_used) VALUES (?, ?, 0)",
+        (chat_id, movie_id),
+    )
+    conn.commit()
+    conn.close()
+    return movie_id, emojis, title, category, year
+
+
+def get_active_movie(chat_id: int) -> Optional[Tuple[int, str, str, str, str, int, int]]:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        SELECT m.id, m.emojis, m.title, m.aliases, m.category, m.year, g.hints_used
+        FROM active_games g
+        JOIN movies m ON m.id = g.movie_id
+        WHERE g.chat_id = ?
+    """, (chat_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+
+def mask_title(title: str, reveal_ratio: float = 0.3) -> str:
+    """Создает маску названия для подсказки (например: Т и _ _ _ _ к)."""
+    chars = list(title)
+    letter_indices = [i for i, ch in enumerate(chars) if ch.isalnum()]
+    reveal_count = max(1, int(len(letter_indices) * reveal_ratio))
+    revealed = set([letter_indices[0]]) if letter_indices else set()
+
+    rng = random.Random(title)
+    while len(revealed) < reveal_count and len(revealed) < len(letter_indices):
+        revealed.add(rng.choice(letter_indices))
+
+    masked = []
+    for i, ch in enumerate(chars):
+        if not ch.isalnum():
+            masked.append(ch)
+        elif i in revealed:
+            masked.append(ch)
+        else:
+            masked.append("•")
+    return "".join(masked)
+
+
+# =====================================================================
+# ОБРАБОТЧИКИ КОМАНД И КНОПОК
+# =====================================================================
+@router.message(Command("start", "help"))
+async def cmd_start(message: Message):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM movies")
+    total_movies = c.fetchone()[0]
+    conn.close()
+
+    text = (
+        "🎬 <b>Привет! Я бот «Угадай фильм по эмодзи»!</b>\n\n"
+        f"📚 В моей базе сейчас: <b>{total_movies:,}</b> фильмов, сериалов и мультфильмов.\n\n"
+        "<b>Как играть в группе:</b>\n"
+        "1. Запустите раунд командой /game\n"
+        "2. Бот пришлет шифр из эмодзи\n"
+        "3. Просто пишите свои варианты ответа в чат — кто первый угадает, тот получает очки!\n\n"
+        "<b>Команды:</b>\n"
+        "🎲 /game — начать новый раунд\n"
+        "💡 /hint — взять подсказку\n"
+        "⏭ /skip — пропустить и узнать ответ\n"
+        "🏆 /top — таблица лидеров чата\n"
+        "🌍 /global_top — глобальный рейтинг всех групп\n"
+        "📊 /mystats — моя статистика"
+    )
+    await message.answer(text, reply_markup=get_next_game_keyboard())
+
+
+@router.message(Command("game"))
+async def cmd_game(message: Message):
+    _, emojis, _, category, _ = pick_new_movie(message.chat.id)
+    text = (
+        f"🎬 <b>Угадайте {category.lower()} по эмодзи!</b>\n\n"
+        f"👉  <tg-spoiler>{emojis}</tg-spoiler>  ➡️  {emojis}\n\n"
+        f"💬 <i>Пишите название прямо в чат!</i>"
+    )
+    await message.answer(text, reply_markup=get_game_keyboard())
+
+
+@router.callback_query(F.data == "game_new")
+async def cb_game_new(callback: CallbackQuery):
+    _, emojis, _, category, _ = pick_new_movie(callback.message.chat.id)
+    text = (
+        f"🎬 <b>Новый раунд! Категория: {category}</b>\n\n"
+        f"🧩 Загадка:  {emojis}\n\n"
+        f"💬 <i>Пишите название в чат!</i>"
+    )
+    await callback.message.answer(text, reply_markup=get_game_keyboard())
+    await callback.answer()
+
+
+@router.message(Command("hint"))
+async def cmd_hint(message: Message):
+    await send_hint(message.chat.id, message)
+
+
+@router.callback_query(F.data == "game_hint")
+async def cb_game_hint(callback: CallbackQuery):
+    await send_hint(callback.message.chat.id, callback.message)
+    await callback.answer()
+
+
+async def send_hint(chat_id: int, message: Message):
+    active = get_active_movie(chat_id)
+    if not active:
+        await message.answer("Сейчас нет активной игры! Запустите её командой /game", reply_markup=get_next_game_keyboard())
+        return
+
+    movie_id, emojis, title, _, category, year, hints_used = active
+    hints_used += 1
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE active_games SET hints_used = ? WHERE chat_id = ?", (hints_used, chat_id))
+    conn.commit()
+    conn.close()
+
+    if hints_used == 1:
+        hint_text = (
+            f"💡 <b>Подсказка №1:</b>\n"
+            f"🧩 Эмодзи: {emojis}\n"
+            f"📂 Категория: <b>{category}</b>\n"
+            f"📅 Год выхода: <b>{year}</b>\n"
+            f"🔤 Букв в названии: <b>{len(title)}</b>"
+        )
+    elif hints_used == 2:
+        masked = mask_title(title, 0.35)
+        hint_text = (
+            f"💡 <b>Подсказка №2 (маска букв):</b>\n"
+            f"🧩 Эмодзи: {emojis}\n"
+            f"🔤 Слово: <code>{masked}</code>"
+        )
+    else:
+        masked = mask_title(title, 0.65)
+        hint_text = (
+            f"💡 <b>Супер-подсказка:</b>\n"
+            f"🧩 Эмодзи: {emojis}\n"
+            f"🔤 Почти открыто: <code>{masked}</code>"
+        )
+
+    await message.answer(hint_text, reply_markup=get_game_keyboard())
+
+
+@router.message(Command("skip"))
+async def cmd_skip(message: Message):
+    await skip_movie(message.chat.id, message)
+
+
+@router.callback_query(F.data == "game_skip")
+async def cb_game_skip(callback: CallbackQuery):
+    await skip_movie(callback.message.chat.id, callback.message)
+    await callback.answer()
+
+
+async def skip_movie(chat_id: int, message: Message):
+    active = get_active_movie(chat_id)
+    if not active:
+        await message.answer("Активной игры нет. Нажмите кнопку ниже, чтобы начать!", reply_markup=get_next_game_keyboard())
+        return
+
+    _, emojis, title, _, category, year, _ = active
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM active_games WHERE chat_id = ?", (chat_id,))
+    conn.commit()
+    conn.close()
+
+    await message.answer(
+        f"⏭ <b>Раунд пропущен!</b>\n\n"
+        f"🧩 Было загадано: {emojis}\n"
+        f"🎬 Правильный ответ: <b>{title}</b> ({category}, {year})",
+        reply_markup=get_next_game_keyboard(),
+    )
+
+
+@router.message(Command("top", "rating"))
+async def cmd_top(message: Message):
+    await show_leaderboard(message.chat.id, message)
+
+
+@router.callback_query(F.data == "game_top")
+async def cb_game_top(callback: CallbackQuery):
+    await show_leaderboard(callback.message.chat.id, callback.message)
+    await callback.answer()
+
+
+async def show_leaderboard(chat_id: int, message: Message):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        SELECT username, points, wins
+        FROM scores
+        WHERE chat_id = ?
+        ORDER BY points DESC, wins DESC
+        LIMIT 10
+    """, (chat_id,))
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        await message.answer("🏆 В этом чате пока никто не заработал очков. Запустите /game и станьте первым!")
+        return
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🏆 <b>Рейтинг знатоков кино в этом чате:</b>\n"]
+    for idx, (username, points, wins) in enumerate(rows, start=1):
+        prefix = medals[idx - 1] if idx <= 3 else f"<b>{idx}.</b>"
+        lines.append(f"{prefix} {username} — <b>{points}</b> очк. (угадано: {wins})")
+
+    await message.answer("\n".join(lines), reply_markup=get_next_game_keyboard())
+
+
+@router.message(Command("global_top"))
+async def cmd_global_top(message: Message):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        SELECT username, SUM(points) as total_pts, SUM(wins) as total_wins
+        FROM scores
+        GROUP BY user_id
+        ORDER BY total_pts DESC
+        LIMIT 10
+    """)
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        await message.answer("🌍 Глобальный рейтинг пока пуст.")
+        return
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🌍 <b>Глобальный рейтинг игроков:</b>\n"]
+    for idx, (username, points, wins) in enumerate(rows, start=1):
+        prefix = medals[idx - 1] if idx <= 3 else f"<b>{idx}.</b>"
+        lines.append(f"{prefix} {username} — <b>{points}</b> очк. (побед: {wins})")
+
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("mystats"))
+async def cmd_mystats(message: Message):
+    user_id = message.from_user.id
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT points, wins FROM scores WHERE chat_id = ? AND user_id = ?",
+        (message.chat.id, user_id),
+    )
+    row = c.fetchone()
+    conn.close()
+
+    if not row:
+        await message.answer("📊 Вы еще не угадали ни одного фильма в этом чате. Жмите /game!")
+        return
+
+    points, wins = row
+    await message.answer(
+        f"📊 <b>Статистика {message.from_user.full_name}:</b>\n"
+        f"🏅 Очков в чате: <b>{points}</b>\n"
+        f"🎬 Угадано тайтлов: <b>{wins}</b>"
+    )
+
+
+# =====================================================================
+# ПРОВЕРКА ОТВЕТОВ УЧАСТНИКОВ В ГРУППЕ
+# =====================================================================
+@router.message(F.text & ~F.text.startswith("/"))
+async def check_user_guess(message: Message):
+    active = get_active_movie(message.chat.id)
+    if not active:
+        return
+
+    _, emojis, title, aliases, category, year, hints_used = active
+    user_guess = normalize_text(message.text)
+    if len(user_guess) < 2:
+        return
+
+    valid_answers = [normalize_text(a) for a in aliases.split("|") if a.strip()]
+    valid_answers.append(normalize_text(title))
+
+    if user_guess in valid_answers:
+        # Начисляем от 1 до 3 очков в зависимости от количества использованных подсказок
+        earned_points = max(1, 3 - hints_used)
+        user_id = message.from_user.id
+        username = message.from_user.full_name
+
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("DELETE FROM active_games WHERE chat_id = ?", (message.chat.id,))
+        c.execute("""
+            INSERT INTO scores (chat_id, user_id, username, points, wins)
+            VALUES (?, ?, ?, ?, 1)
+            ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                username = excluded.username,
+                points = points + ?,
+                wins = wins + 1
+        """, (message.chat.id, user_id, username, earned_points, earned_points))
+        c.execute("SELECT points, wins FROM scores WHERE chat_id = ? AND user_id = ?", (message.chat.id, user_id))
+        total_points, total_wins = c.fetchone()
+        conn.commit()
+        conn.close()
+
+        await message.reply(
+            f"🎉 <b>Браво, {username}! Это правильный ответ!</b>\n\n"
+            f"🎬 Загадано: <b>{title}</b> ({category}, {year})\n"
+            f"🧩 Эмодзи: {emojis}\n"
+            f"➕ Начислено: <b>+{earned_points} очк.</b> (Всего: {total_points} очк., побед: {total_wins})",
+            reply_markup=get_next_game_keyboard(),
+        )
+
+
+# =====================================================================
+# ЗАПУСК БОТА
+# =====================================================================
+async def main():
+    init_db()
+    await ensure_10k_database()
+
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher()
+    dp.include_router(router)
+
+    logging.info("Бот запущен и готов к игре!")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

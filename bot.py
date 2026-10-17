@@ -1,9 +1,11 @@
 import asyncio
 import logging
+import os
 import re
 import sqlite3
 import random
 import urllib.parse
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple, List
 
 import aiohttp
@@ -19,26 +21,23 @@ from aiogram.types import (
 )
 
 # =====================================================================
-# НАСТРОЙКИ (ВСТАВЬТЕ ВАШ ТОКЕН СЮДА)
+# НАСТРОЙКИ И ТОКЕН
 # =====================================================================
-import os
-
-# Бот автоматически подхватит токен из настроек проекта на Bothost.ru
 BOT_TOKEN = (
     os.getenv("BOT_TOKEN")
     or os.getenv("TOKEN")
     or os.getenv("TELEGRAM_BOT_TOKEN")
-    or "ВСТАВЬТЕ_ТОКЕН_ЕСЛИ_ЗАПУСКАЕТЕ_БЕЗ_ПЕРЕМЕННЫХ"
+    or "ВСТАВЬТЕ_СЮДА_ТОКЕН_ОТ_BOTFATHER"
 )
 DB_PATH = "emoji_movies.db"
 TARGET_DB_SIZE = 10000
+MSK_TZ = timezone(timedelta(hours=3))  # Московское время (UTC+3)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 router = Router()
 
 # =====================================================================
 # ЗОЛОТОЙ ФОНД (РУЧНАЯ БАЗА ХИТОВ — ВЫПАДАЕТ В ПЕРВУЮ ОЧЕРЕДЬ)
-# Формат: (Эмодзи, Основное название, Синонимы через |, Категория, Год)
 # =====================================================================
 CURATED_MOVIES = [
     # Фильмы
@@ -63,7 +62,7 @@ CURATED_MOVIES = [
     ("🤖🕶️🏍️🔫🔥", "Терминатор", "терминатор|терминатор 2|судный день", "Фильм", 1984),
     ("🏴‍☠️🚢🧭🐙🗡️", "Пираты Карибского моря", "пираты карибского моря|джек воробей", "Фильм", 2003),
     ("🔵🌿🏹🪐🐉", "Аватар", "аватар|avatar", "Фильм", 2009),
-    ("🏠👦🎄🦹‍♂️🪤", "Один дома", "один дома|home alone", "Фильм", 1990),
+    ("🏠👦🎄🦹‍♂️🪤", "Один дома", "один дома|home alone", "Фильм", 2012),
     ("💎🦾🤖❤️🛡️", "Мстители", "мстители|железный человек|финал|война бесконечности", "Фильм", 2012),
     ("⚔️🏟️🦁👑🩸", "Гладиатор", "гладиатор", "Фильм", 2000),
     ("🏜️🪱🌶️⚔️👑", "Дюна", "дюна|dune", "Фильм", 2021),
@@ -101,7 +100,7 @@ CURATED_MOVIES = [
     ("🦸‍♂️🥛🩸🏢💥", "Пацаны", "пацаны|the boys", "Сериал", 2019),
     ("🎭🏦🔴🔫🇪🇸", "Бумажный дом", "бумажный дом|la casa de papel", "Сериал", 2017),
     ("✈️🏝️🐻‍❄️🔢🌴", "Остаться в живых", "остаться в живых|лост|lost", "Сериал", 2004),
-    ("🚗👻🔫兄弟😈", "Сверхъестественное", "сверхъестественное|supernatural", "Сериал", 2005),
+    ("🚗👻🔫😈👼", "Сверхъестественное", "сверхъестественное|supernatural", "Сериал", 2005),
     ("🏥💊🦯👨‍⚕️🧬", "Доктор Хаус", "доктор хаус|хаус|house", "Сериал", 2004),
     ("☢️🚒🏭⏳🇺🇦", "Чернобыль", "чернобыль|chernobyl", "Сериал", 2019),
     ("♟️👩‍🦰💊🏆🍸", "Ход королевы", "ход королевы|ферзевый гамбит", "Сериал", 2020),
@@ -121,7 +120,6 @@ CURATED_MOVIES = [
     ("⚔️🐴🛡️🐉👑", "Три богатыря", "три богатыря|алеша попович|добрыня никитич|илья муромец", "Мультфильм", 2004),
 ]
 
-# Словари для генерации эмодзи по ключевым словам и жанрам для базы 10 000+
 KEYWORD_EMOJI_MAP = {
     "любов": "❤️", "сердц": "💖", "свадьб": "💍", "невест": "👰", "жених": "🤵",
     "войн": "⚔️", "битв": "🛡️", "солдат": "🪖", "арми": "🎖️", "оружи": "🔫",
@@ -154,28 +152,16 @@ GENRE_EMOJIS = {
     "Сериал": ["📺", "🛋️", "🍿", "🎞️", "🎭"],
     "Мультфильм": ["🎨", "🧸", "✨", "🎈", "🦄"],
     "Мультсериал": ["📺", "🎨", "🧸", "✨", "🎈"],
-    "боевик": ["💥", "🔫", "👊", "🔥", "🚁"],
-    "комедия": ["😂", "🤣", "🎭", "🎉", "🤪"],
-    "ужасы": ["😱", "🔪", "🩸", "👻", "🕯️"],
-    "фантастика": ["🚀", "🪐", "🤖", "⚡", "🧬"],
-    "фэнтези": ["🧙‍♂️", "🐉", "🗡️", "🏰", "🪄"],
-    "мелодрама": ["❤️", "💑", "🌹", "💋", "😢"],
-    "детектив": ["🕵️‍♂️", "🔍", "👣", "🧩", "🚓"],
-    "приключения": ["🗺️", "🧭", "🏝️", "🎒", "⛰️"],
-    "триллер": ["😰", "🔪", "⏳", "🌑", "👁️"],
-    "вестерн": ["🤠", "🐎", "🌵", "🔫", "🏜️"],
 }
 
 
 def normalize_text(text: str) -> str:
-    """Очищает ответ игрока для нестрогого сравнения."""
     text = text.lower().replace("ё", "е")
     text = re.sub(r"[^a-zа-я0-9\s]", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
 
-def title_to_emojis(title: str, category: str, genre_hint: str = "") -> str:
-    """Генерирует уникальную комбинацию из 5 эмодзи на основе названия и жанра."""
+def title_to_emojis(title: str, category: str) -> str:
     lower_title = title.lower().replace("ё", "е")
     chosen = []
 
@@ -185,13 +171,6 @@ def title_to_emojis(title: str, category: str, genre_hint: str = "") -> str:
         if len(chosen) >= 4:
             break
 
-    for g_name, g_emos in GENRE_EMOJIS.items():
-        if g_name.lower() in genre_hint.lower():
-            for emo in g_emos:
-                if emo not in chosen and len(chosen) < 5:
-                    chosen.append(emo)
-
-    # Детерминированный выбор на основе хэша названия, чтобы у каждого фильма был свой набор
     rng = random.Random(lower_title)
     cat_pool = GENRE_EMOJIS.get(category, GENRE_EMOJIS["Фильм"]) + [
         "🌟", "🎭", "🔥", "💎", "🗝️", "🌍", "⚡", "🌙", "☀️", "🎲",
@@ -206,7 +185,7 @@ def title_to_emojis(title: str, category: str, genre_hint: str = "") -> str:
 
 
 # =====================================================================
-# РАБОТА С БАЗОЙ ДАННЫХ SQLITE И АВТОНАПОЛНЕНИЕ 10 000+ ТАЙТЛОВ
+# ИНИЦИАЛИЗАЦИЯ И МИГРАЦИЯ БАЗЫ ДАННЫХ
 # =====================================================================
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -236,13 +215,29 @@ def init_db():
             username TEXT,
             points INTEGER DEFAULT 0,
             wins INTEGER DEFAULT 0,
+            weekly_points INTEGER DEFAULT 0,
+            weekly_wins INTEGER DEFAULT 0,
             PRIMARY KEY (chat_id, user_id)
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS bot_state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+    # Авто-миграция, если таблица scores была создана старой версией бота
+    c.execute("PRAGMA table_info(scores)")
+    existing_cols = [col[1] for col in c.fetchall()]
+    if "weekly_points" not in existing_cols:
+        c.execute("ALTER TABLE scores ADD COLUMN weekly_points INTEGER DEFAULT 0")
+    if "weekly_wins" not in existing_cols:
+        c.execute("ALTER TABLE scores ADD COLUMN weekly_wins INTEGER DEFAULT 0")
+
     c.execute("CREATE INDEX IF NOT EXISTS idx_movies_tier ON movies(tier)")
     conn.commit()
 
-    # Добавляем золотой фонд (tier = 1), если база пустая
     c.execute("SELECT COUNT(*) FROM movies WHERE tier = 1")
     if c.fetchone()[0] == 0:
         for emojis, title, aliases, category, year in CURATED_MOVIES:
@@ -255,13 +250,9 @@ def init_db():
 
 
 async def fetch_wikidata_movies() -> List[Tuple[str, str, str, str, int]]:
-    """Загружает реальные фильмы, сериалы и мультфильмы на русском из Wikidata."""
     sparql_queries = [
-        # Популярные фильмы с русской меткой
         ("Фильм", "wd:Q11424", 4000),
-        # Телесериалы с русской меткой
         ("Сериал", "wd:Q5398426", 3000),
-        # Мультфильмы и мультсериалы
         ("Мультфильм", "wd:Q202866", 3000),
     ]
     results = []
@@ -300,7 +291,6 @@ async def fetch_wikidata_movies() -> List[Tuple[str, str, str, str, int]]:
 
 
 def generate_fallback_catalog(needed: int) -> List[Tuple[str, str, str, str, int]]:
-    """Резервный генератор каталога фильмов/сериалов/мультфильмов до 10 000+ записей."""
     adjectives = [
         "Последний", "Тайный", "Забытый", "Ночной", "Звездный", "Золотой", "Темный",
         "Великий", "Секретный", "Дикий", "Снежный", "Морской", "Королевский", "Огненный",
@@ -337,7 +327,6 @@ def generate_fallback_catalog(needed: int) -> List[Tuple[str, str, str, str, int
 
 
 async def ensure_10k_database():
-    """Проверяет размер базы и автоматически доводит её до 10 000+ записей."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM movies")
@@ -376,6 +365,71 @@ async def ensure_10k_database():
 
 
 # =====================================================================
+# ПЛАНИРОВЩИК ЕЖЕНЕДЕЛЬНОГО СБРОСА (СУББОТА 22:00 МСК)
+# =====================================================================
+async def weekly_reset_scheduler(bot: Bot):
+    """Проверяет московское время и каждую субботу в 22:00 подводит итоги недели."""
+    while True:
+        try:
+            now_msk = datetime.now(MSK_TZ)
+            # weekday() == 5 — это суббота (0 - Пн, 1 - Вт, 2 - Ср, 3 - Чт, 4 - Пт, 5 - Сб, 6 - Вс)
+            if now_msk.weekday() == 5 and now_msk.hour == 22:
+                iso_year, iso_week, _ = now_msk.isocalendar()
+                period_key = f"{iso_year}-W{iso_week}"
+
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute("SELECT value FROM bot_state WHERE key = 'last_weekly_reset'")
+                row = c.fetchone()
+                last_reset = row[0] if row else ""
+
+                if last_reset != period_key:
+                    # Запоминаем, что сброс за эту неделю выполнен
+                    c.execute(
+                        "INSERT OR REPLACE INTO bot_state (key, value) VALUES ('last_weekly_reset', ?)",
+                        (period_key,),
+                    )
+                    conn.commit()
+
+                    # Находим все чаты, где за неделю кто-то набрал очки
+                    c.execute("SELECT DISTINCT chat_id FROM scores WHERE weekly_points > 0")
+                    active_chats = [r[0] for r in c.fetchall()]
+
+                    for chat_id in active_chats:
+                        c.execute("""
+                            SELECT username, weekly_points
+                            FROM scores
+                            WHERE chat_id = ? AND weekly_points > 0
+                            ORDER BY weekly_points DESC, weekly_wins DESC
+                            LIMIT 1
+                        """, (chat_id,))
+                        winner = c.fetchone()
+                        if winner:
+                            winner_name, winner_points = winner
+                            announcement = (
+                                f"👑 <b>Итоги недели!</b>\n\n"
+                                f"Киношлюха этой недели <b>«{winner_name}»</b> набрал(а) "
+                                f"<b>{winner_points}</b> баллов за неделю.\n"
+                                f"Рейтинг обнулился, новая неделя за статус «Киношлюха»!"
+                            )
+                            try:
+                                await bot.send_message(chat_id, announcement)
+                            except Exception as e:
+                                logging.warning(f"Не удалось отправить итоги недели в чат {chat_id}: {e}")
+
+                    # Обнуляем недельный рейтинг во всех чатах
+                    c.execute("UPDATE scores SET weekly_points = 0, weekly_wins = 0")
+                    conn.commit()
+                    logging.info(f"Еженедельный рейтинг «Киношлюха недели» успешно сброшен ({period_key}).")
+
+                conn.close()
+        except Exception as e:
+            logging.error(f"Ошибка в планировщике еженедельного сброса: {e}")
+
+        await asyncio.sleep(20)
+
+
+# =====================================================================
 # ИГРОВАЯ ЛОГИКА И КЛАВИАТУРЫ
 # =====================================================================
 def get_game_keyboard() -> InlineKeyboardMarkup:
@@ -386,7 +440,8 @@ def get_game_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="⏭ Пропустить", callback_data="game_skip"),
             ],
             [
-                InlineKeyboardButton(text="🏆 Рейтинг чата", callback_data="game_top"),
+                InlineKeyboardButton(text="🔥 Киношлюха недели", callback_data="game_weekly_top"),
+                InlineKeyboardButton(text="🏆 Общий рейтинг", callback_data="game_top"),
             ],
         ]
     )
@@ -397,8 +452,11 @@ def get_next_game_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="🎬 Следующий фильм!", callback_data="game_new"),
-                InlineKeyboardButton(text="🏆 Рейтинг", callback_data="game_top"),
-            ]
+            ],
+            [
+                InlineKeyboardButton(text="🔥 Киношлюха недели", callback_data="game_weekly_top"),
+                InlineKeyboardButton(text="🏆 Общий рейтинг", callback_data="game_top"),
+            ],
         ]
     )
 
@@ -407,7 +465,6 @@ def pick_new_movie(chat_id: int, prefer_curated: bool = True) -> Tuple[int, str,
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
-    # В 80% случаев выбираем из золотого фонда и реальных хитов (tier 1 и 2), в 20% — из всей 10k+ базы
     if prefer_curated and random.random() < 0.85:
         c.execute("SELECT id, emojis, title, category, year FROM movies WHERE tier = 1 ORDER BY RANDOM() LIMIT 1")
     else:
@@ -440,7 +497,6 @@ def get_active_movie(chat_id: int) -> Optional[Tuple[int, str, str, str, str, in
 
 
 def mask_title(title: str, reveal_ratio: float = 0.3) -> str:
-    """Создает маску названия для подсказки (например: Т и _ _ _ _ к)."""
     chars = list(title)
     letter_indices = [i for i, ch in enumerate(chars) if ch.isalnum()]
     reveal_count = max(1, int(len(letter_indices) * reveal_ratio))
@@ -478,13 +534,14 @@ async def cmd_start(message: Message):
         "<b>Как играть в группе:</b>\n"
         "1. Запустите раунд командой /game\n"
         "2. Бот пришлет шифр из эмодзи\n"
-        "3. Просто пишите свои варианты ответа в чат — кто первый угадает, тот получает очки!\n\n"
+        "3. Пишите варианты ответа в чат — кто первый угадает, получает баллы в общий зачет и в битву за титул <b>«Киношлюха недели»</b>!\n"
+        "⏰ <i>Итоги недели подводятся каждую субботу в 22:00 по МСК.</i>\n\n"
         "<b>Команды:</b>\n"
         "🎲 /game — начать новый раунд\n"
         "💡 /hint — взять подсказку\n"
         "⏭ /skip — пропустить и узнать ответ\n"
-        "🏆 /top — таблица лидеров чата\n"
-        "🌍 /global_top — глобальный рейтинг всех групп\n"
+        "🔥 /week — рейтинг «Киношлюха недели»\n"
+        "🏆 /top — общий рейтинг группы за всё время\n"
         "📊 /mystats — моя статистика"
     )
     await message.answer(text, reply_markup=get_next_game_keyboard())
@@ -495,7 +552,7 @@ async def cmd_game(message: Message):
     _, emojis, _, category, _ = pick_new_movie(message.chat.id)
     text = (
         f"🎬 <b>Угадайте {category.lower()} по эмодзи!</b>\n\n"
-        f"👉  <tg-spoiler>{emojis}</tg-spoiler>  ➡️  {emojis}\n\n"
+        f"🧩 Загадка:  {emojis}\n\n"
         f"💬 <i>Пишите название прямо в чат!</i>"
     )
     await message.answer(text, reply_markup=get_game_keyboard())
@@ -599,22 +656,22 @@ async def skip_movie(chat_id: int, message: Message):
 
 @router.message(Command("top", "rating"))
 async def cmd_top(message: Message):
-    await show_leaderboard(message.chat.id, message)
+    await show_alltime_leaderboard(message.chat.id, message)
 
 
 @router.callback_query(F.data == "game_top")
 async def cb_game_top(callback: CallbackQuery):
-    await show_leaderboard(callback.message.chat.id, callback.message)
+    await show_alltime_leaderboard(callback.message.chat.id, callback.message)
     await callback.answer()
 
 
-async def show_leaderboard(chat_id: int, message: Message):
+async def show_alltime_leaderboard(chat_id: int, message: Message):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
         SELECT username, points, wins
         FROM scores
-        WHERE chat_id = ?
+        WHERE chat_id = ? AND points > 0
         ORDER BY points DESC, wins DESC
         LIMIT 10
     """, (chat_id,))
@@ -622,43 +679,58 @@ async def show_leaderboard(chat_id: int, message: Message):
     conn.close()
 
     if not rows:
-        await message.answer("🏆 В этом чате пока никто не заработал очков. Запустите /game и станьте первым!")
+        await message.answer("🏆 В общем рейтинге группы пока пусто. Запустите /game и станьте первым!")
         return
 
     medals = ["🥇", "🥈", "🥉"]
-    lines = ["🏆 <b>Рейтинг знатоков кино в этом чате:</b>\n"]
+    lines = ["🏆 <b>Общий рейтинг группы (за всё время):</b>\n"]
     for idx, (username, points, wins) in enumerate(rows, start=1):
         prefix = medals[idx - 1] if idx <= 3 else f"<b>{idx}.</b>"
-        lines.append(f"{prefix} {username} — <b>{points}</b> очк. (угадано: {wins})")
+        lines.append(f"{prefix} {username} — <b>{points}</b> балл. (угадано: {wins})")
 
     await message.answer("\n".join(lines), reply_markup=get_next_game_keyboard())
 
 
-@router.message(Command("global_top"))
-async def cmd_global_top(message: Message):
+@router.message(Command("week", "weekly"))
+async def cmd_week_top(message: Message):
+    await show_weekly_leaderboard(message.chat.id, message)
+
+
+@router.callback_query(F.data == "game_weekly_top")
+async def cb_game_weekly_top(callback: CallbackQuery):
+    await show_weekly_leaderboard(callback.message.chat.id, callback.message)
+    await callback.answer()
+
+
+async def show_weekly_leaderboard(chat_id: int, message: Message):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
-        SELECT username, SUM(points) as total_pts, SUM(wins) as total_wins
+        SELECT username, weekly_points, weekly_wins
         FROM scores
-        GROUP BY user_id
-        ORDER BY total_pts DESC
+        WHERE chat_id = ? AND weekly_points > 0
+        ORDER BY weekly_points DESC, weekly_wins DESC
         LIMIT 10
-    """)
+    """, (chat_id,))
     rows = c.fetchall()
     conn.close()
 
     if not rows:
-        await message.answer("🌍 Глобальный рейтинг пока пуст.")
+        await message.answer(
+            "🔥 <b>Рейтинг «Киношлюха недели» пока пуст!</b>\n"
+            "На этой неделе еще никто не набрал баллов. Жмите /game, чтобы возглавить список!\n\n"
+            "⏰ <i>Подведение итогов и сброс — каждую субботу в 22:00 по МСК.</i>"
+        )
         return
 
-    medals = ["🥇", "🥈", "🥉"]
-    lines = ["🌍 <b>Глобальный рейтинг игроков:</b>\n"]
-    for idx, (username, points, wins) in enumerate(rows, start=1):
+    medals = ["👑", "🥈", "🥉"]
+    lines = ["🔥 <b>Рейтинг «Киношлюха недели» в этой группе:</b>\n"]
+    for idx, (username, w_points, w_wins) in enumerate(rows, start=1):
         prefix = medals[idx - 1] if idx <= 3 else f"<b>{idx}.</b>"
-        lines.append(f"{prefix} {username} — <b>{points}</b> очк. (побед: {wins})")
+        lines.append(f"{prefix} {username} — <b>{w_points}</b> балл. (угадано: {w_wins})")
 
-    await message.answer("\n".join(lines))
+    lines.append("\n⏰ <i>Финал недели и обнуление — в субботу в 22:00 по МСК.</i>")
+    await message.answer("\n".join(lines), reply_markup=get_next_game_keyboard())
 
 
 @router.message(Command("mystats"))
@@ -667,21 +739,21 @@ async def cmd_mystats(message: Message):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        "SELECT points, wins FROM scores WHERE chat_id = ? AND user_id = ?",
+        "SELECT points, wins, weekly_points, weekly_wins FROM scores WHERE chat_id = ? AND user_id = ?",
         (message.chat.id, user_id),
     )
     row = c.fetchone()
     conn.close()
 
     if not row:
-        await message.answer("📊 Вы еще не угадали ни одного фильма в этом чате. Жмите /game!")
+        await message.answer("📊 Вы еще не угадали ни одного фильма в этой группе. Жмите /game!")
         return
 
-    points, wins = row
+    points, wins, weekly_points, weekly_wins = row
     await message.answer(
-        f"📊 <b>Статистика {message.from_user.full_name}:</b>\n"
-        f"🏅 Очков в чате: <b>{points}</b>\n"
-        f"🎬 Угадано тайтлов: <b>{wins}</b>"
+        f"📊 <b>Статистика {message.from_user.full_name}:</b>\n\n"
+        f"🔥 <b>За эту неделю («Киношлюха»):</b> {weekly_points} балл. (угадано: {weekly_wins})\n"
+        f"🏆 <b>За всё время в группе:</b> {points} балл. (угадано: {wins})"
     )
 
 
@@ -703,7 +775,6 @@ async def check_user_guess(message: Message):
     valid_answers.append(normalize_text(title))
 
     if user_guess in valid_answers:
-        # Начисляем от 1 до 3 очков в зависимости от количества использованных подсказок
         earned_points = max(1, 3 - hints_used)
         user_id = message.from_user.id
         username = message.from_user.full_name
@@ -712,15 +783,21 @@ async def check_user_guess(message: Message):
         c = conn.cursor()
         c.execute("DELETE FROM active_games WHERE chat_id = ?", (message.chat.id,))
         c.execute("""
-            INSERT INTO scores (chat_id, user_id, username, points, wins)
-            VALUES (?, ?, ?, ?, 1)
+            INSERT INTO scores (chat_id, user_id, username, points, wins, weekly_points, weekly_wins)
+            VALUES (?, ?, ?, ?, 1, ?, 1)
             ON CONFLICT(chat_id, user_id) DO UPDATE SET
                 username = excluded.username,
                 points = points + ?,
-                wins = wins + 1
-        """, (message.chat.id, user_id, username, earned_points, earned_points))
-        c.execute("SELECT points, wins FROM scores WHERE chat_id = ? AND user_id = ?", (message.chat.id, user_id))
-        total_points, total_wins = c.fetchone()
+                wins = wins + 1,
+                weekly_points = weekly_points + ?,
+                weekly_wins = weekly_wins + 1
+        """, (message.chat.id, user_id, username, earned_points, earned_points, earned_points, earned_points))
+
+        c.execute(
+            "SELECT points, weekly_points FROM scores WHERE chat_id = ? AND user_id = ?",
+            (message.chat.id, user_id),
+        )
+        total_points, weekly_points = c.fetchone()
         conn.commit()
         conn.close()
 
@@ -728,7 +805,8 @@ async def check_user_guess(message: Message):
             f"🎉 <b>Браво, {username}! Это правильный ответ!</b>\n\n"
             f"🎬 Загадано: <b>{title}</b> ({category}, {year})\n"
             f"🧩 Эмодзи: {emojis}\n"
-            f"➕ Начислено: <b>+{earned_points} очк.</b> (Всего: {total_points} очк., побед: {total_wins})",
+            f"➕ Начислено: <b>+{earned_points} балл.</b>\n"
+            f"🔥 За неделю: <b>{weekly_points} балл.</b> | 🏆 Всего: <b>{total_points} балл.</b>",
             reply_markup=get_next_game_keyboard(),
         )
 
@@ -743,6 +821,9 @@ async def main():
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
+
+    # Запуск фонового таймера для подведения итогов по субботам в 22:00 МСК
+    asyncio.create_task(weekly_reset_scheduler(bot))
 
     logging.info("Бот запущен и готов к игре!")
     await dp.start_polling(bot)

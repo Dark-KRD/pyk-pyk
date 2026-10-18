@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import os
 import re
@@ -18,6 +19,7 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    User,
 )
 
 # =====================================================================
@@ -32,6 +34,10 @@ BOT_TOKEN = (
 DB_PATH = "emoji_movies.db"
 TARGET_DB_SIZE = 10000
 MSK_TZ = timezone(timedelta(hours=3))  # Московское время (UTC+3)
+
+# Если False: берет Тег в группе -> если его нет, берет Имя.
+# Если True:  берет Тег в группе -> если нет, берет @username -> если нет, берет Имя.
+USE_USERNAME_FALLBACK = False
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 router = Router()
@@ -62,7 +68,7 @@ CURATED_MOVIES = [
     ("🤖🕶️🏍️🔫🔥", "Терминатор", "терминатор|терминатор 2|судный день", "Фильм", 1984),
     ("🏴‍☠️🚢🧭🐙🗡️", "Пираты Карибского моря", "пираты карибского моря|джек воробей", "Фильм", 2003),
     ("🔵🌿🏹🪐🐉", "Аватар", "аватар|avatar", "Фильм", 2009),
-    ("🏠👦🎄🦹‍♂️🪤", "Один дома", "один дома|home alone", "Фильм", 2012),
+    ("🏠👦🎄🦹‍♂️🪤", "Один дома", "один дома|home alone", "Фильм", 1990),
     ("💎🦾🤖❤️🛡️", "Мстители", "мстители|железный человек|финал|война бесконечности", "Фильм", 2012),
     ("⚔️🏟️🦁👑🩸", "Гладиатор", "гладиатор", "Фильм", 2000),
     ("🏜️🪱🌶️⚔️👑", "Дюна", "дюна|dune", "Фильм", 2021),
@@ -185,6 +191,82 @@ def title_to_emojis(title: str, category: str) -> str:
 
 
 # =====================================================================
+# ПОЛУЧЕНИЕ ТЕГА УЧАСТНИКА В ГРУППЕ ИЛИ ИМЕНИ
+# =====================================================================
+async def get_player_display_name(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+    fallback_name: str = "Игрок",
+    fallback_username: Optional[str] = None,
+    message: Optional[Message] = None,
+) -> str:
+    """
+    Проверяет наличие у пользователя тега (должности) в группе.
+    Если тег есть — возвращает его. Если тега нет — возвращает имя.
+    """
+    # 1. Проверяем тег напрямую в объекте сообщения (для новых версий Bot API)
+    if message:
+        msg_tag = getattr(message, "sender_tag", None) or (getattr(message, "model_extra", None) or {}).get("sender_tag")
+        if msg_tag and str(msg_tag).strip():
+            return html.escape(str(msg_tag).strip())
+
+    # 2. Запрашиваем данные участника в группе через getChatMember
+    if chat_id < 0:
+        try:
+            member = await bot.get_chat_member(chat_id, user_id)
+            extra = getattr(member, "model_extra", None) or {}
+            custom_title = (
+                getattr(member, "custom_title", None)
+                or getattr(member, "tag", None)
+                or extra.get("custom_title")
+                or extra.get("tag")
+            )
+            if custom_title and str(custom_title).strip():
+                return html.escape(str(custom_title).strip())
+
+            if getattr(member, "user", None):
+                fallback_name = member.user.full_name or fallback_name
+                fallback_username = member.user.username or fallback_username
+        except Exception:
+            pass
+
+    # 3. Если включен резервный вариант через @username
+    if USE_USERNAME_FALLBACK and fallback_username:
+        return html.escape(f"@{fallback_username.lstrip('@')}")
+
+    # 4. Если тега нет — возвращаем обычное имя
+    return html.escape(fallback_name)
+
+
+async def resolve_and_sync_leaderboard_names(
+    bot: Bot, chat_id: int, rows: List[Tuple[int, str, int, int]]
+) -> List[Tuple[str, int, int]]:
+    """
+    Актуализирует теги/имена для топ-10 игроков перед выводом рейтинга
+    и сохраняет изменения в базу.
+    """
+    updated_rows = []
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    for user_id, saved_name, pts, wins in rows:
+        # unescape на случай, если в базе уже было экранированное имя
+        clean_saved = html.unescape(saved_name)
+        display_name = await get_player_display_name(bot, chat_id, user_id, fallback_name=clean_saved)
+        if display_name != saved_name:
+            c.execute(
+                "UPDATE scores SET username = ? WHERE chat_id = ? AND user_id = ?",
+                (display_name, chat_id, user_id),
+            )
+        updated_rows.append((display_name, pts, wins))
+
+    conn.commit()
+    conn.close()
+    return updated_rows
+
+
+# =====================================================================
 # ИНИЦИАЛИЗАЦИЯ И МИГРАЦИЯ БАЗЫ ДАННЫХ
 # =====================================================================
 def init_db():
@@ -227,7 +309,6 @@ def init_db():
         )
     """)
 
-    # Авто-миграция, если таблица scores была создана старой версией бота
     c.execute("PRAGMA table_info(scores)")
     existing_cols = [col[1] for col in c.fetchall()]
     if "weekly_points" not in existing_cols:
@@ -372,7 +453,7 @@ async def weekly_reset_scheduler(bot: Bot):
     while True:
         try:
             now_msk = datetime.now(MSK_TZ)
-            # weekday() == 5 — это суббота (0 - Пн, 1 - Вт, 2 - Ср, 3 - Чт, 4 - Пт, 5 - Сб, 6 - Вс)
+            # weekday() == 5 — суббота
             if now_msk.weekday() == 5 and now_msk.hour == 22:
                 iso_year, iso_week, _ = now_msk.isocalendar()
                 period_key = f"{iso_year}-W{iso_week}"
@@ -384,20 +465,18 @@ async def weekly_reset_scheduler(bot: Bot):
                 last_reset = row[0] if row else ""
 
                 if last_reset != period_key:
-                    # Запоминаем, что сброс за эту неделю выполнен
                     c.execute(
                         "INSERT OR REPLACE INTO bot_state (key, value) VALUES ('last_weekly_reset', ?)",
                         (period_key,),
                     )
                     conn.commit()
 
-                    # Находим все чаты, где за неделю кто-то набрал очки
                     c.execute("SELECT DISTINCT chat_id FROM scores WHERE weekly_points > 0")
                     active_chats = [r[0] for r in c.fetchall()]
 
                     for chat_id in active_chats:
                         c.execute("""
-                            SELECT username, weekly_points
+                            SELECT user_id, username, weekly_points
                             FROM scores
                             WHERE chat_id = ? AND weekly_points > 0
                             ORDER BY weekly_points DESC, weekly_wins DESC
@@ -405,10 +484,13 @@ async def weekly_reset_scheduler(bot: Bot):
                         """, (chat_id,))
                         winner = c.fetchone()
                         if winner:
-                            winner_name, winner_points = winner
+                            winner_id, saved_name, winner_points = winner
+                            winner_display = await get_player_display_name(
+                                bot, chat_id, winner_id, fallback_name=html.unescape(saved_name)
+                            )
                             announcement = (
                                 f"👑 <b>Итоги недели!</b>\n\n"
-                                f"Киношлюха этой недели <b>«{winner_name}»</b> набрал(а) "
+                                f"Киношлюха этой недели <b>«{winner_display}»</b> набрал(а) "
                                 f"<b>{winner_points}</b> баллов за неделю.\n"
                                 f"Рейтинг обнулился, новая неделя за статус «Киношлюха»!"
                             )
@@ -417,7 +499,6 @@ async def weekly_reset_scheduler(bot: Bot):
                             except Exception as e:
                                 logging.warning(f"Не удалось отправить итоги недели в чат {chat_id}: {e}")
 
-                    # Обнуляем недельный рейтинг во всех чатах
                     c.execute("UPDATE scores SET weekly_points = 0, weekly_wins = 0")
                     conn.commit()
                     logging.info(f"Еженедельный рейтинг «Киношлюха недели» успешно сброшен ({period_key}).")
@@ -535,6 +616,7 @@ async def cmd_start(message: Message):
         "1. Запустите раунд командой /game\n"
         "2. Бот пришлет шифр из эмодзи\n"
         "3. Пишите варианты ответа в чат — кто первый угадает, получает баллы в общий зачет и в битву за титул <b>«Киношлюха недели»</b>!\n"
+        "🏷 <i>В рейтингах отображается ваш тег в группе (а если его нет — ваше имя).</i>\n"
         "⏰ <i>Итоги недели подводятся каждую субботу в 22:00 по МСК.</i>\n\n"
         "<b>Команды:</b>\n"
         "🎲 /game — начать новый раунд\n"
@@ -655,67 +737,69 @@ async def skip_movie(chat_id: int, message: Message):
 
 
 @router.message(Command("top", "rating"))
-async def cmd_top(message: Message):
-    await show_alltime_leaderboard(message.chat.id, message)
+async def cmd_top(message: Message, bot: Bot):
+    await show_alltime_leaderboard(bot, message.chat.id, message)
 
 
 @router.callback_query(F.data == "game_top")
-async def cb_game_top(callback: CallbackQuery):
-    await show_alltime_leaderboard(callback.message.chat.id, callback.message)
+async def cb_game_top(callback: CallbackQuery, bot: Bot):
+    await show_alltime_leaderboard(bot, callback.message.chat.id, callback.message)
     await callback.answer()
 
 
-async def show_alltime_leaderboard(chat_id: int, message: Message):
+async def show_alltime_leaderboard(bot: Bot, chat_id: int, message: Message):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
-        SELECT username, points, wins
+        SELECT user_id, username, points, wins
         FROM scores
         WHERE chat_id = ? AND points > 0
         ORDER BY points DESC, wins DESC
         LIMIT 10
     """, (chat_id,))
-    rows = c.fetchall()
+    raw_rows = c.fetchall()
     conn.close()
 
-    if not rows:
+    if not raw_rows:
         await message.answer("🏆 В общем рейтинге группы пока пусто. Запустите /game и станьте первым!")
         return
 
+    rows = await resolve_and_sync_leaderboard_names(bot, chat_id, raw_rows)
+
     medals = ["🥇", "🥈", "🥉"]
     lines = ["🏆 <b>Общий рейтинг группы (за всё время):</b>\n"]
-    for idx, (username, points, wins) in enumerate(rows, start=1):
+    for idx, (display_name, points, wins) in enumerate(rows, start=1):
         prefix = medals[idx - 1] if idx <= 3 else f"<b>{idx}.</b>"
-        lines.append(f"{prefix} {username} — <b>{points}</b> балл. (угадано: {wins})")
+        lines.append(f"{prefix} {display_name} — <b>{points}</b> балл. (угадано: {wins})")
 
     await message.answer("\n".join(lines), reply_markup=get_next_game_keyboard())
 
 
 @router.message(Command("week", "weekly"))
-async def cmd_week_top(message: Message):
-    await show_weekly_leaderboard(message.chat.id, message)
+async def cmd_week_top(message: Message, bot: Bot):
+    await show_weekly_leaderboard(bot, message.chat.id, message)
 
 
 @router.callback_query(F.data == "game_weekly_top")
-async def cb_game_weekly_top(callback: CallbackQuery):
-    await show_weekly_leaderboard(callback.message.chat.id, callback.message)
+async def cb_game_weekly_top(callback: CallbackQuery, bot: Bot):
+    await show_weekly_leaderboard(bot, callback.message.chat.id, callback.message)
     await callback.answer()
 
 
-async def show_weekly_leaderboard(chat_id: int, message: Message):
+async def show_weekly_leaderboard(bot: Bot, chat_id: int, message: Message):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
-        SELECT username, weekly_points, weekly_wins
+        SELECT user_id, username, weekly_points, weekly_wins
         FROM scores
         WHERE chat_id = ? AND weekly_points > 0
         ORDER BY weekly_points DESC, weekly_wins DESC
         LIMIT 10
     """, (chat_id,))
-    rows = c.fetchall()
+    raw_rows = c.fetchall()
     conn.close()
 
-    if not rows:
+    if not raw_rows:
         await message.answer(
             "🔥 <b>Рейтинг «Киношлюха недели» пока пуст!</b>\n"
             "На этой неделе еще никто не набрал баллов. Жмите /game, чтобы возглавить список!\n\n"
@@ -723,35 +807,47 @@ async def show_weekly_leaderboard(chat_id: int, message: Message):
         )
         return
 
+    rows = await resolve_and_sync_leaderboard_names(bot, chat_id, raw_rows)
+
     medals = ["👑", "🥈", "🥉"]
     lines = ["🔥 <b>Рейтинг «Киношлюха недели» в этой группе:</b>\n"]
-    for idx, (username, w_points, w_wins) in enumerate(rows, start=1):
+    for idx, (display_name, w_points, w_wins) in enumerate(rows, start=1):
         prefix = medals[idx - 1] if idx <= 3 else f"<b>{idx}.</b>"
-        lines.append(f"{prefix} {username} — <b>{w_points}</b> балл. (угадано: {w_wins})")
+        lines.append(f"{prefix} {display_name} — <b>{w_points}</b> балл. (угадано: {w_wins})")
 
     lines.append("\n⏰ <i>Финал недели и обнуление — в субботу в 22:00 по МСК.</i>")
     await message.answer("\n".join(lines), reply_markup=get_next_game_keyboard())
 
 
 @router.message(Command("mystats"))
-async def cmd_mystats(message: Message):
-    user_id = message.from_user.id
+async def cmd_mystats(message: Message, bot: Bot):
+    user = message.from_user
+    display_name = await get_player_display_name(
+        bot, message.chat.id, user.id, fallback_name=user.full_name, fallback_username=user.username, message=message
+    )
+
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
         "SELECT points, wins, weekly_points, weekly_wins FROM scores WHERE chat_id = ? AND user_id = ?",
-        (message.chat.id, user_id),
+        (message.chat.id, user.id),
     )
     row = c.fetchone()
+    if row:
+        c.execute(
+            "UPDATE scores SET username = ? WHERE chat_id = ? AND user_id = ?",
+            (display_name, message.chat.id, user.id),
+        )
+        conn.commit()
     conn.close()
 
     if not row:
-        await message.answer("📊 Вы еще не угадали ни одного фильма в этой группе. Жмите /game!")
+        await message.answer(f"📊 <b>{display_name}</b>, вы еще не угадали ни одного фильма в этой группе. Жмите /game!")
         return
 
     points, wins, weekly_points, weekly_wins = row
     await message.answer(
-        f"📊 <b>Статистика {message.from_user.full_name}:</b>\n\n"
+        f"📊 <b>Статистика игрока {display_name}:</b>\n\n"
         f"🔥 <b>За эту неделю («Киношлюха»):</b> {weekly_points} балл. (угадано: {weekly_wins})\n"
         f"🏆 <b>За всё время в группе:</b> {points} балл. (угадано: {wins})"
     )
@@ -761,7 +857,7 @@ async def cmd_mystats(message: Message):
 # ПРОВЕРКА ОТВЕТОВ УЧАСТНИКОВ В ГРУППЕ
 # =====================================================================
 @router.message(F.text & ~F.text.startswith("/"))
-async def check_user_guess(message: Message):
+async def check_user_guess(message: Message, bot: Bot):
     active = get_active_movie(message.chat.id)
     if not active:
         return
@@ -776,8 +872,10 @@ async def check_user_guess(message: Message):
 
     if user_guess in valid_answers:
         earned_points = max(1, 3 - hints_used)
-        user_id = message.from_user.id
-        username = message.from_user.full_name
+        user = message.from_user
+        display_name = await get_player_display_name(
+            bot, message.chat.id, user.id, fallback_name=user.full_name, fallback_username=user.username, message=message
+        )
 
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -791,18 +889,18 @@ async def check_user_guess(message: Message):
                 wins = wins + 1,
                 weekly_points = weekly_points + ?,
                 weekly_wins = weekly_wins + 1
-        """, (message.chat.id, user_id, username, earned_points, earned_points, earned_points, earned_points))
+        """, (message.chat.id, user.id, display_name, earned_points, earned_points, earned_points, earned_points))
 
         c.execute(
             "SELECT points, weekly_points FROM scores WHERE chat_id = ? AND user_id = ?",
-            (message.chat.id, user_id),
+            (message.chat.id, user.id),
         )
         total_points, weekly_points = c.fetchone()
         conn.commit()
         conn.close()
 
         await message.reply(
-            f"🎉 <b>Браво, {username}! Это правильный ответ!</b>\n\n"
+            f"🎉 <b>Браво, {display_name}! Это правильный ответ!</b>\n\n"
             f"🎬 Загадано: <b>{title}</b> ({category}, {year})\n"
             f"🧩 Эмодзи: {emojis}\n"
             f"➕ Начислено: <b>+{earned_points} балл.</b>\n"
